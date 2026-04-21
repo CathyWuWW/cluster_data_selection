@@ -139,20 +139,40 @@ python analysis/nearest_neighbor_sanity.py \
   --trust-remote-code
 ```
 
+By default, `--out-dir` is treated as an experiment root. The script creates a
+parameterized run subdirectory such as:
+
+```text
+analysis_outputs/nn_sanity/qwen05b_balanced/20260421_153012_qwen2.5-0.5b_n1000_stratified_q100_k10_len512_layers-middle-last_pool-mean_norm-l2_pc-0-1-3_seed42/
+```
+
+Use `--run-name <name>` for a shorter explicit run directory, or
+`--flat-output` to write directly into `--out-dir`.
+
+The experiment root also gets an updated `runs_summary.csv`; this is the
+cross-run comparison table to use when comparing settings like `n1000` versus
+`nall`, random versus stratified sampling, or different PC-removal choices.
+
 Main outputs:
 
 ```text
-analysis_outputs/nn_sanity/qwen05b_natural_1k/manifest.json
-analysis_outputs/nn_sanity/qwen05b_natural_1k/metrics.json
-analysis_outputs/nn_sanity/qwen05b_natural_1k/samples.jsonl
-analysis_outputs/nn_sanity/qwen05b_natural_1k/features/*.npy
-analysis_outputs/nn_sanity/qwen05b_natural_1k/nearest_neighbors/<representation>/neighbors.jsonl
-analysis_outputs/nn_sanity/qwen05b_natural_1k/nearest_neighbors/<representation>/neighbors.csv
+analysis_outputs/nn_sanity/<experiment_root>/<run_name>/manifest.json
+analysis_outputs/nn_sanity/<experiment_root>/<run_name>/metrics.json
+analysis_outputs/nn_sanity/<experiment_root>/<run_name>/summary.csv
+analysis_outputs/nn_sanity/<experiment_root>/<run_name>/samples.jsonl
+analysis_outputs/nn_sanity/<experiment_root>/<run_name>/features/*.npy
+analysis_outputs/nn_sanity/<experiment_root>/<run_name>/nearest_neighbors/<representation>/neighbors.jsonl
+analysis_outputs/nn_sanity/<experiment_root>/<run_name>/nearest_neighbors/<representation>/neighbors.csv
+analysis_outputs/nn_sanity/<experiment_root>/runs_summary.csv
 ```
 
 The CSV/JSONL neighbor tables include query text/source/length, neighbor
 text/source/length, rank, cosine distance, and `same_source`. These are the
 files to inspect manually for the first sanity-check pass.
+
+Use `summary.csv` for quick horizontal comparison across representations. It
+includes same-source neighbor rate, lift versus a random same-source baseline,
+norm-length correlation, and top-PC variance ratios.
 
 For balanced exports, avoid `--sample-strategy first` when using a small
 `--max-samples`; exported files may be source-blocked, so the first 1000 records

@@ -13,6 +13,7 @@ import json
 import math
 import random
 import time
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -45,7 +46,24 @@ def parse_args() -> argparse.Namespace:
         description="Export nearest-neighbor sanity tables for hidden representations."
     )
     parser.add_argument("--input-jsonl", required=True)
-    parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--out-dir",
+        required=True,
+        help=(
+            "Experiment output root. By default, a parameterized run subdirectory "
+            "is created inside this directory."
+        ),
+    )
+    parser.add_argument(
+        "--run-name",
+        default="",
+        help="Optional run subdirectory name. If omitted, one is generated from key args.",
+    )
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help="Write directly into --out-dir, preserving the older output layout.",
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--tokenizer", default=None)
     parser.add_argument("--max-samples", type=int, default=10_000)
@@ -121,6 +139,56 @@ def parse_args() -> argparse.Namespace:
         help="Print feature extraction progress every N batches. Set 0 to disable.",
     )
     return parser.parse_args()
+
+
+def _slug(value: str) -> str:
+    value = value.strip().lower()
+    chars = []
+    for ch in value:
+        if ch.isalnum():
+            chars.append(ch)
+        elif ch in {".", "-", "_"}:
+            chars.append(ch)
+        else:
+            chars.append("-")
+    slug = "".join(chars).strip("-._")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "run"
+
+
+def build_run_name(args: argparse.Namespace) -> str:
+    if args.run_name:
+        return _slug(args.run_name)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model = _slug(args.model.split("/")[-1])
+    sample_size = "all" if args.max_samples <= 0 else str(args.max_samples)
+    parts = [
+        timestamp,
+        model,
+        f"n{sample_size}",
+        args.sample_strategy,
+        f"q{args.query_count}",
+        f"k{args.top_k}",
+        f"len{args.max_length}",
+        f"layers-{_slug(args.layers)}",
+        f"pool-{_slug(args.poolings)}",
+        f"norm-{_slug(args.normalize_options)}",
+        f"pc-{_slug(args.remove_top_pcs)}",
+        f"seed{args.seed}",
+    ]
+    return "_".join(parts)
+
+
+def resolve_output_dirs(args: argparse.Namespace) -> Tuple[Path, Path]:
+    output_root = Path(args.out_dir)
+    if args.flat_output:
+        run_dir = output_root
+    else:
+        run_dir = output_root / build_run_name(args)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return output_root, run_dir
 
 
 def _read_all_samples(path: Path) -> List[Sample]:
@@ -474,6 +542,25 @@ def source_neighbor_rate(samples: List[Sample], query_indices: np.ndarray, neigh
     return matches / total if total else 0.0
 
 
+def source_counts(samples: List[Sample]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for sample in samples:
+        counts[sample.source] = counts.get(sample.source, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def random_same_source_baseline(samples: List[Sample], query_indices: np.ndarray) -> float:
+    if len(samples) <= 1 or len(query_indices) == 0:
+        return 0.0
+    counts = source_counts(samples)
+    rates = []
+    for query_idx in query_indices:
+        query = samples[int(query_idx)]
+        same_source_candidates = max(counts.get(query.source, 0) - 1, 0)
+        rates.append(same_source_candidates / (len(samples) - 1))
+    return float(np.mean(rates)) if rates else 0.0
+
+
 def preview(text: str, limit: int) -> str:
     text = " ".join(text.split())
     if len(text) <= limit:
@@ -564,10 +651,169 @@ def write_feature_files(out_dir: Path, features: Dict[str, np.ndarray]) -> Dict[
     return paths
 
 
+def write_summary_csv(
+    out_dir: Path,
+    metrics: Dict[str, object],
+    feature_paths: Dict[str, str],
+) -> str:
+    summary_path = out_dir / "summary.csv"
+    fieldnames = [
+        "representation",
+        "layer",
+        "pooling",
+        "normalize",
+        "remove_top_pcs",
+        "same_source_neighbor_rate",
+        "same_source_lift_vs_random",
+        "random_same_source_baseline",
+        "norm_length_corr",
+        "feature_norm_mean",
+        "feature_norm_std",
+        "pc1_variance_ratio",
+        "pc2_variance_ratio",
+        "pc3_variance_ratio",
+        "pc4_variance_ratio",
+        "pc5_variance_ratio",
+        "neighbors_csv",
+        "feature_path",
+    ]
+    baseline = float(metrics.get("random_same_source_baseline", 0.0))
+    reps = metrics.get("representations", {})
+    with summary_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for name, rep_metrics in reps.items():
+            same_source_rate = float(rep_metrics.get("same_source_neighbor_rate", 0.0))
+            lift = same_source_rate / baseline if baseline > 0 else 0.0
+            row = {
+                "representation": name,
+                "layer": rep_metrics.get("layer"),
+                "pooling": rep_metrics.get("pooling"),
+                "normalize": rep_metrics.get("normalize"),
+                "remove_top_pcs": rep_metrics.get("remove_top_pcs"),
+                "same_source_neighbor_rate": same_source_rate,
+                "same_source_lift_vs_random": lift,
+                "random_same_source_baseline": baseline,
+                "norm_length_corr": rep_metrics.get("norm_length_corr"),
+                "feature_norm_mean": rep_metrics.get("feature_norm_mean"),
+                "feature_norm_std": rep_metrics.get("feature_norm_std"),
+                "pc1_variance_ratio": rep_metrics.get("pc1_variance_ratio"),
+                "pc2_variance_ratio": rep_metrics.get("pc2_variance_ratio"),
+                "pc3_variance_ratio": rep_metrics.get("pc3_variance_ratio"),
+                "pc4_variance_ratio": rep_metrics.get("pc4_variance_ratio"),
+                "pc5_variance_ratio": rep_metrics.get("pc5_variance_ratio"),
+                "neighbors_csv": str(out_dir / "nearest_neighbors" / name / "neighbors.csv"),
+                "feature_path": feature_paths.get(name, ""),
+            }
+            writer.writerow(row)
+    return str(summary_path)
+
+
+def _summary_rows(
+    run_dir: Path,
+    metrics: Dict[str, object],
+    feature_paths: Dict[str, str],
+) -> List[Dict[str, object]]:
+    baseline = float(metrics.get("random_same_source_baseline", 0.0))
+    reps = metrics.get("representations", {})
+    rows: List[Dict[str, object]] = []
+    for name, rep_metrics in reps.items():
+        same_source_rate = float(rep_metrics.get("same_source_neighbor_rate", 0.0))
+        rows.append(
+            {
+                "run_dir": str(run_dir),
+                "model": metrics.get("model"),
+                "input_jsonl": metrics.get("input_jsonl"),
+                "num_samples": metrics.get("num_samples"),
+                "sample_strategy": metrics.get("sample_strategy"),
+                "query_count": metrics.get("query_count"),
+                "top_k": metrics.get("top_k"),
+                "seed": metrics.get("seed"),
+                "source_counts_json": json.dumps(
+                    metrics.get("source_counts", {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "representation": name,
+                "layer": rep_metrics.get("layer"),
+                "pooling": rep_metrics.get("pooling"),
+                "normalize": rep_metrics.get("normalize"),
+                "remove_top_pcs": rep_metrics.get("remove_top_pcs"),
+                "same_source_neighbor_rate": same_source_rate,
+                "same_source_lift_vs_random": same_source_rate / baseline if baseline > 0 else 0.0,
+                "random_same_source_baseline": baseline,
+                "norm_length_corr": rep_metrics.get("norm_length_corr"),
+                "feature_norm_mean": rep_metrics.get("feature_norm_mean"),
+                "feature_norm_std": rep_metrics.get("feature_norm_std"),
+                "pc1_variance_ratio": rep_metrics.get("pc1_variance_ratio"),
+                "pc2_variance_ratio": rep_metrics.get("pc2_variance_ratio"),
+                "pc3_variance_ratio": rep_metrics.get("pc3_variance_ratio"),
+                "pc4_variance_ratio": rep_metrics.get("pc4_variance_ratio"),
+                "pc5_variance_ratio": rep_metrics.get("pc5_variance_ratio"),
+                "summary_csv": str(run_dir / "summary.csv"),
+                "neighbors_csv": str(run_dir / "nearest_neighbors" / name / "neighbors.csv"),
+                "feature_path": feature_paths.get(name, ""),
+            }
+        )
+    return rows
+
+
+def update_runs_summary_csv(
+    output_root: Path,
+    run_dir: Path,
+    metrics: Dict[str, object],
+    feature_paths: Dict[str, str],
+) -> str:
+    summary_path = output_root / "runs_summary.csv"
+    fieldnames = [
+        "run_dir",
+        "model",
+        "input_jsonl",
+        "num_samples",
+        "sample_strategy",
+        "query_count",
+        "top_k",
+        "seed",
+        "source_counts_json",
+        "representation",
+        "layer",
+        "pooling",
+        "normalize",
+        "remove_top_pcs",
+        "same_source_neighbor_rate",
+        "same_source_lift_vs_random",
+        "random_same_source_baseline",
+        "norm_length_corr",
+        "feature_norm_mean",
+        "feature_norm_std",
+        "pc1_variance_ratio",
+        "pc2_variance_ratio",
+        "pc3_variance_ratio",
+        "pc4_variance_ratio",
+        "pc5_variance_ratio",
+        "summary_csv",
+        "neighbors_csv",
+        "feature_path",
+    ]
+
+    rows: List[Dict[str, object]] = []
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows.extend(row for row in reader if row.get("run_dir") != str(run_dir))
+    rows.extend(_summary_rows(run_dir, metrics, feature_paths))
+
+    with summary_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(summary_path)
+
+
 def main() -> None:
     args = parse_args()
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    output_root, out_dir = resolve_output_dirs(args)
+    print(f"[output] root={output_root} run_dir={out_dir}", flush=True)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -603,11 +849,15 @@ def main() -> None:
     metrics = {
         "input_jsonl": args.input_jsonl,
         "model": args.model,
+        "output_root": str(output_root),
+        "run_dir": str(out_dir),
         "num_samples": len(samples),
         "sample_strategy": args.sample_strategy,
+        "source_counts": source_counts(samples),
         "query_count": query_count,
         "top_k": args.top_k,
         "seed": args.seed,
+        "random_same_source_baseline": random_same_source_baseline(samples, query_indices),
         "representations": {},
     }
 
@@ -633,14 +883,20 @@ def main() -> None:
         }
         metrics["representations"][spec.name] = rep_metrics
 
+    summary_path = write_summary_csv(out_dir, metrics, feature_paths)
+    runs_summary_path = update_runs_summary_csv(output_root, out_dir, metrics, feature_paths)
     manifest = {
         "created_at_unix": int(time.time()),
         "args": vars(args),
+        "output_root": str(output_root),
+        "run_dir": str(out_dir),
         "num_layers": num_layers,
         "specs": [asdict(spec) for spec in specs],
         "outputs": {
             "samples": str(out_dir / "samples.jsonl"),
             "metrics": str(out_dir / "metrics.json"),
+            "summary": summary_path,
+            "runs_summary": runs_summary_path,
             "features": feature_paths,
             "nearest_neighbors_dir": str(out_dir / "nearest_neighbors"),
         },
