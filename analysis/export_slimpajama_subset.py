@@ -19,9 +19,11 @@ import argparse
 import json
 import os
 import random
+import sys
+import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 DEFAULT_DATASET = "DKYoon/SlimPajama-6B"
@@ -75,6 +77,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="If >0, stop after scanning this many records even if quotas are not met.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1_000,
+        help="Print progress every N scanned records. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=100,
+        help="Flush output JSONL files every N written records. Set 0 to disable.",
     )
     parser.add_argument(
         "--shuffle-buffer",
@@ -166,6 +180,68 @@ def write_record(handle, text: str, source: str, record: Mapping[str, Any], samp
     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def flush_writers(handles) -> None:
+    for handle in handles.values():
+        handle.flush()
+
+
+def summarise_counter(counter: Counter, top_k: int = 8) -> str:
+    if not counter:
+        return "{}"
+    parts = [f"{key}:{value}" for key, value in counter.most_common(top_k)]
+    remaining = len(counter) - len(parts)
+    if remaining > 0:
+        parts.append(f"...+{remaining}")
+    return "{" + ", ".join(parts) + "}"
+
+
+def maybe_report_progress(
+    args: argparse.Namespace,
+    handles,
+    scanned: int,
+    written: int,
+    started_at: float,
+    counts,
+    source_counts,
+    last_report: int,
+) -> int:
+    should_flush = args.flush_every > 0 and written > 0 and written % args.flush_every == 0
+    should_report = args.progress_every > 0 and scanned - last_report >= args.progress_every
+    if should_flush or should_report:
+        flush_writers(handles)
+    if not should_report:
+        return last_report
+
+    elapsed = max(time.time() - started_at, 1e-6)
+    rate = scanned / elapsed
+    log(
+        "[progress] "
+        f"scanned={scanned} written={written} rate={rate:.1f}/s "
+        f"counts={format_counts(counts)} "
+        f"sources={format_source_counts(source_counts)}"
+    )
+    return scanned
+
+
+def format_counts(counts) -> str:
+    if isinstance(counts, Counter):
+        return "{" + ", ".join(f"{k}:{counts[k]}" for k in ("train", "repr", "val")) + "}"
+    return "{" + ", ".join(
+        f"{split}:{sum(counter.values())}" for split, counter in counts.items()
+    ) + "}"
+
+
+def format_source_counts(source_counts) -> str:
+    return "{" + ", ".join(
+        f"{split}:{summarise_counter(counter)}"
+        for split, counter in source_counts.items()
+    ) + "}"
+
+
 def iter_dataset(args: argparse.Namespace) -> Iterable[Mapping[str, Any]]:
     try:
         from datasets import load_dataset
@@ -176,6 +252,11 @@ def iter_dataset(args: argparse.Namespace) -> Iterable[Mapping[str, Any]]:
         ) from exc
 
     streaming = not args.no_streaming
+    log(
+        "[load] "
+        f"dataset={args.dataset} split={args.split} streaming={streaming} "
+        f"shuffle={not args.no_shuffle} shuffle_buffer={args.shuffle_buffer if not args.no_shuffle else 0}"
+    )
     ds = load_dataset(args.dataset, split=args.split, streaming=streaming)
     if streaming and not args.no_shuffle:
         ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
@@ -189,7 +270,11 @@ def iter_dataset(args: argparse.Namespace) -> Iterable[Mapping[str, Any]]:
     return (ds[i] for i in indices)
 
 
-def export_natural(args: argparse.Namespace, rows: Iterable[Mapping[str, Any]], handles):
+def export_natural(
+    args: argparse.Namespace,
+    rows: Iterable[Mapping[str, Any]],
+    handles,
+) -> Tuple[Counter, Dict[str, Counter], int]:
     targets = {
         "train": args.train_size,
         "repr": args.repr_size,
@@ -199,9 +284,19 @@ def export_natural(args: argparse.Namespace, rows: Iterable[Mapping[str, Any]], 
     source_counts = {name: Counter() for name in targets}
     scanned = 0
     sample_id = 0
+    started_at = time.time()
+    last_report = 0
+    log(
+        "[export] "
+        f"mode=natural targets={{train:{args.train_size}, repr:{args.repr_size}, val:{args.val_size}}}"
+    )
 
     for record in rows:
         scanned += 1
+        last_report = maybe_report_progress(
+            args, handles, scanned, sample_id, started_at,
+            counts, source_counts, last_report,
+        )
         if args.max_scan > 0 and scanned > args.max_scan:
             break
 
@@ -218,11 +313,25 @@ def export_natural(args: argparse.Namespace, rows: Iterable[Mapping[str, Any]], 
         counts[split_name] += 1
         source_counts[split_name][str(source)] += 1
         sample_id += 1
+        last_report = maybe_report_progress(
+            args, handles, scanned, sample_id, started_at,
+            counts, source_counts, last_report,
+        )
 
+    flush_writers(handles)
+    log(
+        "[done] "
+        f"mode=natural scanned={scanned} written={sample_id} "
+        f"counts={format_counts(counts)} sources={format_source_counts(source_counts)}"
+    )
     return counts, source_counts, scanned
 
 
-def export_stratified(args: argparse.Namespace, rows: Iterable[Mapping[str, Any]], handles):
+def export_stratified(
+    args: argparse.Namespace,
+    rows: Iterable[Mapping[str, Any]],
+    handles,
+) -> Tuple[Counter, Dict[str, Counter], int]:
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
     targets = {
         "train": split_quotas(args.train_size, sources),
@@ -233,6 +342,14 @@ def export_stratified(args: argparse.Namespace, rows: Iterable[Mapping[str, Any]
     source_counts = {name: Counter() for name in targets}
     scanned = 0
     sample_id = 0
+    started_at = time.time()
+    last_report = 0
+    log(
+        "[export] "
+        f"mode=stratified targets="
+        f"{{train:{args.train_size}, repr:{args.repr_size}, val:{args.val_size}}} "
+        f"sources={sources}"
+    )
 
     def all_done() -> bool:
         for split_name, quotas in targets.items():
@@ -243,6 +360,10 @@ def export_stratified(args: argparse.Namespace, rows: Iterable[Mapping[str, Any]
 
     for record in rows:
         scanned += 1
+        last_report = maybe_report_progress(
+            args, handles, scanned, sample_id, started_at,
+            counts, source_counts, last_report,
+        )
         if args.max_scan > 0 and scanned > args.max_scan:
             break
 
@@ -269,11 +390,21 @@ def export_stratified(args: argparse.Namespace, rows: Iterable[Mapping[str, Any]
         counts[split_name][source] += 1
         source_counts[split_name][source] += 1
         sample_id += 1
+        last_report = maybe_report_progress(
+            args, handles, scanned, sample_id, started_at,
+            counts, source_counts, last_report,
+        )
 
         if all_done():
             break
 
+    flush_writers(handles)
     flat_counts = Counter({name: sum(c.values()) for name, c in counts.items()})
+    log(
+        "[done] "
+        f"mode=stratified scanned={scanned} written={sample_id} "
+        f"counts={format_counts(counts)} sources={format_source_counts(source_counts)}"
+    )
     return flat_counts, source_counts, scanned
 
 
@@ -288,6 +419,7 @@ def main() -> None:
 
     paths, handles = open_writers(out_dir)
     try:
+        log(f"[start] out_dir={out_dir}")
         rows = iter_dataset(args)
         if args.mode == "natural":
             counts, source_counts, scanned = export_natural(args, rows, handles)

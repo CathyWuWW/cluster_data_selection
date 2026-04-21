@@ -42,7 +42,9 @@ python analysis/export_slimpajama_subset.py \
   --repr-size 10000 \
   --val-size 5000 \
   --seed 42 \
-  --no-shuffle \
+  --shuffle-buffer 1 \
+  --progress-every 10000 \
+  --flush-every 1000 \
   --hard-exit
 ```
 
@@ -68,7 +70,9 @@ python analysis/export_slimpajama_subset.py \
   --repr-size 10000 \
   --val-size 5000 \
   --seed 42 \
-  --no-shuffle \
+  --shuffle-buffer 1 \
+  --progress-every 10000 \
+  --flush-every 1000 \
   --hard-exit
 ```
 
@@ -85,7 +89,9 @@ python analysis/export_slimpajama_subset.py \
   --val-size 5 \
   --max-scan 2000 \
   --seed 42 \
-  --no-shuffle \
+  --shuffle-buffer 1 \
+  --progress-every 100 \
+  --flush-every 10 \
   --hard-exit \
   --overwrite
 ```
