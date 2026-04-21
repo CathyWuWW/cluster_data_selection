@@ -112,3 +112,43 @@ torchrun --nproc_per_node=8 train.py --config configs/default.yaml \
   data.dev_dir=valid \
   training.save_dir=outputs/slimpajama_balanced_smoke
 ```
+
+## Nearest-Neighbor Sanity Check
+
+After exporting a `repr/repr_eval.jsonl` subset, run the first representation
+sanity check. Start with a small model and a few thousand samples before using a
+large training model.
+
+```bash
+python analysis/nearest_neighbor_sanity.py \
+  --input-jsonl local_data/slimpajama_6b_natural_10k/repr/repr_eval.jsonl \
+  --out-dir analysis_outputs/nn_sanity/qwen05b_natural_1k \
+  --model Qwen/Qwen2.5-0.5B \
+  --max-samples 1000 \
+  --query-count 100 \
+  --top-k 10 \
+  --layers middle,last \
+  --poolings mean,last \
+  --normalize-options raw,l2 \
+  --remove-top-pcs 0 \
+  --batch-size 8 \
+  --max-length 512 \
+  --dtype bfloat16 \
+  --attn-impl sdpa \
+  --trust-remote-code
+```
+
+Main outputs:
+
+```text
+analysis_outputs/nn_sanity/qwen05b_natural_1k/manifest.json
+analysis_outputs/nn_sanity/qwen05b_natural_1k/metrics.json
+analysis_outputs/nn_sanity/qwen05b_natural_1k/samples.jsonl
+analysis_outputs/nn_sanity/qwen05b_natural_1k/features/*.npy
+analysis_outputs/nn_sanity/qwen05b_natural_1k/nearest_neighbors/<representation>/neighbors.jsonl
+analysis_outputs/nn_sanity/qwen05b_natural_1k/nearest_neighbors/<representation>/neighbors.csv
+```
+
+The CSV/JSONL neighbor tables include query text/source/length, neighbor
+text/source/length, rank, cosine distance, and `same_source`. These are the
+files to inspect manually for the first sanity-check pass.
