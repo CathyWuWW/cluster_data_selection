@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from collections import Counter
 from pathlib import Path
@@ -82,9 +83,25 @@ def parse_args() -> argparse.Namespace:
         help="Streaming shuffle buffer size.",
     )
     parser.add_argument(
+        "--no-shuffle",
+        action="store_true",
+        help=(
+            "Do not shuffle streaming data. Useful on mirrors where streaming "
+            "shuffle can make downloads less stable."
+        ),
+    )
+    parser.add_argument(
         "--no-streaming",
         action="store_true",
         help="Load the dataset normally instead of using Hugging Face streaming.",
+    )
+    parser.add_argument(
+        "--hard-exit",
+        action="store_true",
+        help=(
+            "Exit with os._exit(0) after writing outputs. This works around rare "
+            "pyarrow/datasets shutdown crashes after successful streaming export."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -160,12 +177,15 @@ def iter_dataset(args: argparse.Namespace) -> Iterable[Mapping[str, Any]]:
 
     streaming = not args.no_streaming
     ds = load_dataset(args.dataset, split=args.split, streaming=streaming)
-    if streaming:
+    if streaming and not args.no_shuffle:
         ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
+        return ds
+    if streaming:
         return ds
 
     indices = list(range(len(ds)))
-    random.Random(args.seed).shuffle(indices)
+    if not args.no_shuffle:
+        random.Random(args.seed).shuffle(indices)
     return (ds[i] for i in indices)
 
 
@@ -286,6 +306,8 @@ def main() -> None:
         "source_field": args.source_field,
         "min_chars": args.min_chars,
         "max_chars": args.max_chars,
+        "shuffle": not args.no_shuffle,
+        "shuffle_buffer": args.shuffle_buffer if not args.no_shuffle else 0,
         "scanned_records": scanned,
         "outputs": {name: str(path) for name, path in paths.items()},
         "counts": dict(counts),
@@ -297,6 +319,8 @@ def main() -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    if args.hard_exit:
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,16 @@ Install the extra data-loading dependency:
 pip install datasets pyarrow
 ```
 
+When running from a network that cannot reach Hugging Face directly, use the
+mirror and keep caches inside the project workspace:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HOME=/home/dataset-assist-0/usr/lh/wyn/data_selection/.hf_cache
+export HF_DATASETS_CACHE=/home/dataset-assist-0/usr/lh/wyn/data_selection/.hf_cache/datasets
+export HF_HUB_ENABLE_HF_TRANSFER=0
+```
+
 ## Balanced subset
 
 Balanced sampling gives each RedPajama source roughly the same number of
@@ -31,7 +41,9 @@ python analysis/export_slimpajama_subset.py \
   --train-size 100000 \
   --repr-size 10000 \
   --val-size 5000 \
-  --seed 42
+  --seed 42 \
+  --no-shuffle \
+  --hard-exit
 ```
 
 Outputs:
@@ -55,7 +67,9 @@ python analysis/export_slimpajama_subset.py \
   --train-size 100000 \
   --repr-size 10000 \
   --val-size 5000 \
-  --seed 42
+  --seed 42 \
+  --no-shuffle \
+  --hard-exit
 ```
 
 ## Smoke test
@@ -65,16 +79,21 @@ For a quick connectivity check on the server:
 ```bash
 python analysis/export_slimpajama_subset.py \
   --out-dir local_data/slimpajama_smoke \
-  --mode stratified \
-  --train-size 70 \
-  --repr-size 14 \
-  --val-size 14 \
-  --max-scan 50000 \
-  --seed 42
+  --mode natural \
+  --train-size 20 \
+  --repr-size 5 \
+  --val-size 5 \
+  --max-scan 2000 \
+  --seed 42 \
+  --no-shuffle \
+  --hard-exit \
+  --overwrite
 ```
 
 If the smoke test cannot fill all quotas, increase `--max-scan` or use
-`--mode natural`.
+`--mode natural`. On some mirrors, pyarrow/datasets can crash during Python
+shutdown even after files are written correctly; `--hard-exit` skips that
+shutdown path after the manifest is safely written.
 
 ## Training override
 
