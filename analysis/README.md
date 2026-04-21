@@ -178,3 +178,69 @@ For balanced exports, avoid `--sample-strategy first` when using a small
 `--max-samples`; exported files may be source-blocked, so the first 1000 records
 can all come from one source. Use `--sample-strategy stratified` or set
 `--max-samples 0` to read the full `repr_eval.jsonl`.
+
+## Representation Comparison
+
+The second validation layer compares hidden-state representations with
+sentence-embedding, lexical, random, length, and source baselines. Keep this as
+an independent analysis script before wiring anything into the training loop.
+
+Recommended balanced run:
+
+```bash
+python analysis/representation_comparison.py \
+  --input-jsonl local_data/slimpajama_6b_balanced/repr/repr_eval.jsonl \
+  --out-dir analysis_outputs/representation_comparison/qwen05b_balanced \
+  --hidden-model Qwen/Qwen2.5-0.5B \
+  --max-samples 1000 \
+  --sample-strategy stratified \
+  --query-count 200 \
+  --top-k 10 \
+  --hidden-layers "first,1,2,3,middle,-4,-3,-2,last" \
+  --hidden-layer-groups "early=first,1,2,3;middle=middle;late=-4,-3,-2;final=last" \
+  --poolings mean,last \
+  --normalize-options l2 \
+  --remove-top-pcs 0,1,3 \
+  --include-whitening \
+  --sentence-models intfloat/e5-small-v2,BAAI/bge-small-en-v1.5 \
+  --include-random \
+  --include-lexical \
+  --include-length-source \
+  --kmeans-k 10,20,50 \
+  --batch-size 8 \
+  --max-length 512 \
+  --dtype bfloat16 \
+  --attn-impl sdpa \
+  --trust-remote-code
+```
+
+Main outputs:
+
+```text
+analysis_outputs/representation_comparison/qwen05b_balanced/<run_name>/manifest.json
+analysis_outputs/representation_comparison/qwen05b_balanced/<run_name>/samples.jsonl
+analysis_outputs/representation_comparison/qwen05b_balanced/<run_name>/representation_summary.csv
+analysis_outputs/representation_comparison/qwen05b_balanced/<run_name>/clustering_summary.csv
+```
+
+`representation_summary.csv` compares top-k source-neighbor rate, lift over
+random source matching, length correlation, and PC variance ratios.
+`clustering_summary.csv` compares MiniBatchKMeans inertia, cosine silhouette,
+cluster size distribution, and source purity/entropy.
+
+Plot the CSV summaries:
+
+```bash
+python analysis/plot_representation_comparison.py \
+  --run-dir analysis_outputs/representation_comparison/qwen05b_balanced/<run_name>
+```
+
+Figures are written to:
+
+```text
+analysis_outputs/representation_comparison/qwen05b_balanced/<run_name>/figures/
+```
+
+Use these plots to judge whether hidden mean representations are close to
+sentence embedding baselines, merely better than random/lexical/source
+baselines, or mainly organized by source/length/template artifacts.
