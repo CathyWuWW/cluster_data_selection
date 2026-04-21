@@ -125,6 +125,7 @@ python analysis/nearest_neighbor_sanity.py \
   --out-dir analysis_outputs/nn_sanity/qwen05b_balanced \
   --model Qwen/Qwen2.5-0.5B \
   --max-samples 0 \
+  --sample-strategy stratified \
   --query-count 100 \
   --top-k 10 \
   --layers middle,last \
@@ -152,3 +153,8 @@ analysis_outputs/nn_sanity/qwen05b_natural_1k/nearest_neighbors/<representation>
 The CSV/JSONL neighbor tables include query text/source/length, neighbor
 text/source/length, rank, cosine distance, and `same_source`. These are the
 files to inspect manually for the first sanity-check pass.
+
+For balanced exports, avoid `--sample-strategy first` when using a small
+`--max-samples`; exported files may be source-blocked, so the first 1000 records
+can all come from one source. Use `--sample-strategy stratified` or set
+`--max-samples 0` to read the full `repr_eval.jsonl`.

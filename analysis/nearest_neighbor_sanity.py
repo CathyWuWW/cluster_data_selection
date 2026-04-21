@@ -23,6 +23,7 @@ import numpy as np
 @dataclass
 class Sample:
     sample_index: int
+    original_index: int
     sample_id: str
     source: str
     text: str
@@ -48,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--tokenizer", default=None)
     parser.add_argument("--max-samples", type=int, default=10_000)
+    parser.add_argument(
+        "--sample-strategy",
+        choices=["first", "random", "stratified"],
+        default="first",
+        help=(
+            "How to select max-samples from the JSONL file. 'first' preserves "
+            "the old behavior; 'random' samples across the whole file; "
+            "'stratified' samples approximately evenly by source."
+        ),
+    )
     parser.add_argument("--query-count", type=int, default=200)
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -112,12 +123,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_samples(path: Path, max_samples: int) -> List[Sample]:
+def _read_all_samples(path: Path) -> List[Sample]:
     samples: List[Sample] = []
     with path.open("r", encoding="utf-8") as f:
         for idx, line in enumerate(f):
-            if max_samples > 0 and len(samples) >= max_samples:
-                break
             line = line.strip()
             if not line:
                 continue
@@ -131,6 +140,7 @@ def load_samples(path: Path, max_samples: int) -> List[Sample]:
             samples.append(
                 Sample(
                     sample_index=len(samples),
+                    original_index=idx,
                     sample_id=sample_id,
                     source=source,
                     text=text,
@@ -138,6 +148,71 @@ def load_samples(path: Path, max_samples: int) -> List[Sample]:
                 )
             )
     return samples
+
+
+def _reindex_samples(samples: List[Sample]) -> List[Sample]:
+    for idx, sample in enumerate(samples):
+        sample.sample_index = idx
+    return samples
+
+
+def _select_random(samples: List[Sample], max_samples: int, seed: int) -> List[Sample]:
+    if max_samples <= 0 or max_samples >= len(samples):
+        return _reindex_samples(samples)
+    rng = np.random.default_rng(seed)
+    selected_indices = np.sort(rng.choice(len(samples), size=max_samples, replace=False))
+    return _reindex_samples([samples[int(i)] for i in selected_indices])
+
+
+def _select_stratified(samples: List[Sample], max_samples: int, seed: int) -> List[Sample]:
+    if max_samples <= 0 or max_samples >= len(samples):
+        return _reindex_samples(samples)
+
+    by_source: Dict[str, List[int]] = {}
+    for idx, sample in enumerate(samples):
+        by_source.setdefault(sample.source, []).append(idx)
+
+    sources = sorted(by_source)
+    base = max_samples // len(sources)
+    remainder = max_samples % len(sources)
+    quotas = {source: base for source in sources}
+    for source in sources[:remainder]:
+        quotas[source] += 1
+
+    rng = np.random.default_rng(seed)
+    selected: List[int] = []
+    underfilled = 0
+    for source in sources:
+        indices = by_source[source]
+        quota = quotas[source]
+        if len(indices) <= quota:
+            selected.extend(indices)
+            underfilled += quota - len(indices)
+        else:
+            selected.extend(rng.choice(indices, size=quota, replace=False).tolist())
+
+    if underfilled > 0 and len(selected) < max_samples:
+        selected_set = set(selected)
+        remaining = [idx for idx in range(len(samples)) if idx not in selected_set]
+        take = min(underfilled, len(remaining), max_samples - len(selected))
+        if take > 0:
+            selected.extend(rng.choice(remaining, size=take, replace=False).tolist())
+
+    selected = sorted(selected[:max_samples])
+    return _reindex_samples([samples[idx] for idx in selected])
+
+
+def load_samples(path: Path, max_samples: int, strategy: str, seed: int) -> List[Sample]:
+    samples = _read_all_samples(path)
+    if strategy == "first":
+        if max_samples > 0:
+            samples = samples[:max_samples]
+        return _reindex_samples(samples)
+    if strategy == "random":
+        return _select_random(samples, max_samples, seed)
+    if strategy == "stratified":
+        return _select_stratified(samples, max_samples, seed)
+    raise ValueError(f"Unknown sample strategy: {strategy}")
 
 
 def resolve_layer(layer: str, num_layers: int) -> int:
@@ -429,6 +504,7 @@ def write_neighbors(
         "representation",
         "query_rank",
         "query_index",
+        "query_original_index",
         "query_sample_id",
         "query_source",
         "query_length_chars",
@@ -436,6 +512,7 @@ def write_neighbors(
         "query_text",
         "neighbor_rank",
         "neighbor_index",
+        "neighbor_original_index",
         "neighbor_sample_id",
         "neighbor_source",
         "neighbor_length_chars",
@@ -455,6 +532,7 @@ def write_neighbors(
                     "representation": spec.name,
                     "query_rank": query_rank,
                     "query_index": query.sample_index,
+                    "query_original_index": query.original_index,
                     "query_sample_id": query.sample_id,
                     "query_source": query.source,
                     "query_length_chars": query.length_chars,
@@ -462,6 +540,7 @@ def write_neighbors(
                     "query_text": preview(query.text, text_preview_chars),
                     "neighbor_rank": neighbor_rank,
                     "neighbor_index": neighbor.sample_index,
+                    "neighbor_original_index": neighbor.original_index,
                     "neighbor_sample_id": neighbor.sample_id,
                     "neighbor_source": neighbor.source,
                     "neighbor_length_chars": neighbor.length_chars,
@@ -493,7 +572,12 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    samples = load_samples(Path(args.input_jsonl), args.max_samples)
+    samples = load_samples(
+        Path(args.input_jsonl),
+        max_samples=args.max_samples,
+        strategy=args.sample_strategy,
+        seed=args.seed,
+    )
     if len(samples) < 2:
         raise SystemExit("Need at least two samples for nearest-neighbor analysis.")
 
@@ -520,6 +604,7 @@ def main() -> None:
         "input_jsonl": args.input_jsonl,
         "model": args.model,
         "num_samples": len(samples),
+        "sample_strategy": args.sample_strategy,
         "query_count": query_count,
         "top_k": args.top_k,
         "seed": args.seed,
