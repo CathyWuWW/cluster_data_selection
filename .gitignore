@@ -2,6 +2,8 @@
 dataset-100k/
 outputs/
 valid/
+local_data/
+analysis_outputs/
 
 # Python
 __pycache__/
