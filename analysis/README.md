@@ -121,20 +121,20 @@ large training model.
 
 ```bash
 python analysis/nearest_neighbor_sanity.py \
-  --input-jsonl local_data/slimpajama_6b_natural_10k/repr/repr_eval.jsonl \
-  --out-dir analysis_outputs/nn_sanity/qwen05b_natural_1k \
+  --input-jsonl local_data/slimpajama_6b_balanced/repr/repr_eval.jsonl \
+  --out-dir analysis_outputs/nn_sanity/qwen05b_balanced \
   --model Qwen/Qwen2.5-0.5B \
-  --max-samples 1000 \
+  --max-samples 0 \
   --query-count 100 \
   --top-k 10 \
   --layers middle,last \
-  --poolings mean,last \
-  --normalize-options raw,l2 \
-  --remove-top-pcs 0 \
+  --poolings mean \
+  --normalize-options l2 \
   --batch-size 8 \
   --max-length 512 \
   --dtype bfloat16 \
   --attn-impl sdpa \
+  --remove-top-pcs 0,1,3 \
   --trust-remote-code
 ```
 
