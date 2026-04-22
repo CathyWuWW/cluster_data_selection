@@ -244,3 +244,65 @@ analysis_outputs/representation_comparison/qwen05b_balanced/<run_name>/figures/
 Use these plots to judge whether hidden mean representations are close to
 sentence embedding baselines, merely better than random/lexical/source
 baselines, or mainly organized by source/length/template artifacts.
+
+## Semantic Reference Compatibility
+
+This validation uses E5/BGE as semantic reference spaces rather than
+ground-truth labels. It asks whether hidden representations preserve the
+nearest-neighbor sets and similarity rankings induced by sentence embedding
+models. Run both all-candidate and cross-source candidate metrics; the
+cross-source setting is important because earlier checks show strong source
+structure.
+
+```bash
+python analysis/semantic_reference_eval.py \
+  --input-jsonl local_data/slimpajama_6b_balanced/repr/repr_eval.jsonl \
+  --out-dir analysis_outputs/semantic_reference/qwen05b_balanced \
+  --hidden-model Qwen/Qwen2.5-0.5B \
+  --max-samples 1000 \
+  --sample-strategy stratified \
+  --query-count 200 \
+  --candidate-count 500 \
+  --top-k 10,50 \
+  --hidden-representations "layer12_mean_l2:middle:mean:l2:0;layer12_mean_l2_rm1pc:middle:mean:l2:1;layer23_mean_l2:last:mean:l2:0;layer23_mean_l2_rm1pc:last:mean:l2:1" \
+  --reference-models intfloat/e5-small-v2,BAAI/bge-small-en-v1.5 \
+  --include-tfidf \
+  --include-random \
+  --batch-size 8 \
+  --max-length 512 \
+  --dtype bfloat16 \
+  --attn-impl sdpa \
+  --trust-remote-code
+```
+
+Main output:
+
+```text
+analysis_outputs/semantic_reference/qwen05b_balanced/<run_name>/semantic_reference_metrics.csv
+```
+
+Key columns:
+
+```text
+overlap_at_10 / overlap_at_50
+jaccard_at_10 / jaccard_at_50
+spearman_mean
+mode = all or cross_source
+```
+
+Plot the results:
+
+```bash
+python analysis/plot_semantic_reference_eval.py \
+  --run-dir analysis_outputs/semantic_reference/qwen05b_balanced/<run_name> \
+  --top-k 10
+```
+
+Interpretation:
+
+- Hidden close to E5/BGE and above TF-IDF/random, especially in
+  `cross_source`, supports semantic compatibility.
+- Hidden close only in `all` but much weaker in `cross_source` suggests source
+  or format shortcuts.
+- Hidden far below E5/BGE but above random/TF-IDF means it may be useful for
+  domain structure, but should not be called a semantic representation.
