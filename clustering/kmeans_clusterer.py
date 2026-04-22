@@ -77,8 +77,17 @@ class _KMeansBase(BaseClusterer):
             )
             feature_mode = "intermediate"
 
+        normalize = str(getattr(cfg.clustering.kmeans, "normalize", "none")).lower()
+        remove_top_pcs = int(getattr(cfg.clustering.kmeans, "remove_top_pcs", 0))
+
         # ---- Streaming MiniBatch KMeans (multi-GPU data-parallel) ----
         if world_size > 1 and isinstance(self, MiniBatchKMeansClusterer):
+            if remove_top_pcs > 0:
+                raise ValueError(
+                    "clustering.kmeans.remove_top_pcs is not supported by "
+                    "streaming multi-GPU MiniBatchKMeans. Run single-process "
+                    "training for this ablation, or set remove_top_pcs=0."
+                )
             return self._fit_streaming(
                 dataset, model, device, cfg, feature_mode, batch_size,
                 K, N, rank, world_size,
@@ -87,6 +96,7 @@ class _KMeansBase(BaseClusterer):
         # ---- Single-GPU fallback: extract all features then cluster ----
         features = self._extract_features(dataset, model, device, cfg, feature_mode, batch_size)
         logger.info(f"Feature matrix shape: {features.shape}")
+        features = self._postprocess_features(features, normalize=normalize, remove_top_pcs=remove_top_pcs)
 
         if rank == 0:
             cluster_ids = self._run_kmeans(features, K, cfg)
@@ -112,6 +122,38 @@ class _KMeansBase(BaseClusterer):
             return self._extract_intermediate_features(dataset, model, device, cfg, batch_size)
         else:
             raise ValueError(f"Unknown feature mode: {feature_mode}")
+
+    @staticmethod
+    def _postprocess_features(
+        features: np.ndarray,
+        normalize: str = "none",
+        remove_top_pcs: int = 0,
+    ) -> np.ndarray:
+        """Apply optional feature transforms before KMeans.
+
+        Defaults preserve the original algorithm. `remove_top_pcs` follows the
+        representation validation scripts: center features, remove the leading
+        PCA directions, then optionally L2-normalize rows.
+        """
+        x = np.asarray(features, dtype=np.float32)
+        if remove_top_pcs > 0:
+            logger.info(f"Removing top {remove_top_pcs} principal components before KMeans")
+            centered = x - x.mean(axis=0, keepdims=True)
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+            pcs = vh[:remove_top_pcs]
+            x = centered - centered @ pcs.T @ pcs
+            x = x.astype(np.float32)
+
+        if normalize in ("none", "raw", ""):
+            return x
+        if normalize == "l2":
+            logger.info("Applying L2 normalization before KMeans")
+            norms = np.linalg.norm(x, axis=1, keepdims=True)
+            return (x / np.maximum(norms, 1e-12)).astype(np.float32)
+        raise ValueError(
+            f"Unknown clustering.kmeans.normalize={normalize!r}. "
+            "Use 'none' or 'l2'."
+        )
 
     def _fit_streaming(
         self, dataset, model, device, cfg, feature_mode, batch_size,

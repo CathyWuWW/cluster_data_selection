@@ -60,6 +60,8 @@ clustering:
     embed_layer: -1             # layer index for intermediate mode (-1 = middle layer)
                                 # e.g. Qwen3-8B has 32 layers, -1 → layer 16
                                 # set 0..N-1 for a specific layer
+    normalize: "none"           # none | l2; optional feature normalization before KMeans
+    remove_top_pcs: 0           # remove top PCA directions before KMeans; 0 preserves old behavior
     feature_batch_size: 256     # batch size when extracting features for KMeans (GPU free during clustering)
   embedding_model:              # Optional separate small model for clustering feature extraction
     enabled: true               # if true, use a lightweight model for embeddings (much faster)
