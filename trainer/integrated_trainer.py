@@ -1312,8 +1312,32 @@ class IntegratedClusterTrainer:
 
         emb_cfg = getattr(cfg.clustering, "embedding_model", None)
         use_embed_model = emb_cfg is not None and getattr(emb_cfg, "enabled", False)
+        use_random_clusterer = getattr(cfg.clustering, "method", "") == "random"
 
-        if use_embed_model:
+        if use_random_clusterer and not hasattr(self, "train_base_dataset"):
+            # Initial random clustering runs before the training dataset/model
+            # exists. Load only the tokenizer so the sample count matches the
+            # later JsonFolderDataset filtering.
+            _print_rank0("Preparing tokenized dataset for random clustering ...", self.rank)
+            random_tokenizer = AutoTokenizer.from_pretrained(
+                cfg.model.path, use_fast=True, trust_remote_code=True
+            )
+            if random_tokenizer.pad_token is None:
+                random_tokenizer.pad_token = random_tokenizer.eos_token
+
+            random_dataset = JsonFolderDataset(
+                data_dir=cfg.data.train_dir,
+                tokenizer=random_tokenizer,
+                text_field=cfg.data.text_field,
+                max_length=cfg.model.max_length,
+                split_name="random_cluster",
+            )
+            cluster_ids = clusterer.fit(
+                random_dataset, None, random_tokenizer,
+                device, cfg, rank=self.rank, world_size=self.world_size,
+            )
+            del random_tokenizer, random_dataset
+        elif use_embed_model:
             # ---- All ranks load the small model for parallel embedding ----
             _print_rank0(f"Loading embedding model from {emb_cfg.path} ...", self.rank)
             embed_tokenizer = AutoTokenizer.from_pretrained(
