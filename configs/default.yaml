@@ -20,6 +20,7 @@ data:
   dev_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/valid"   # MMLU validation set (1531 samples)
   text_field: "text"            # key name in each JSON record to use as text
   dev_num: 100                   # max number of dev samples for PMP backward gradient
+  dev_seed: 42                  # random seed when subsampling dev_num from a larger dev directory
   num_workers: 2                # DataLoader workers
   eval_format: "fewshot"        # fewshot | text  (fewshot = MCQ accuracy; text = LM loss)
   n_shot: 3                     # number of few-shot demonstrations (0 = zero-shot)
@@ -46,6 +47,7 @@ clustering:
                                   #   kmeans:    sklearn full KMeans (more accurate, slower)
                                   #   faiss:     Faiss GPU KMeans (fastest for large datasets)
                                   #   random:    random assignment (baseline)
+  precomputed_ids_path: ""       # optional fixed cluster_ids*.npy or cluster_assignments*.json
   cluster_size: 500             # target number of samples per cluster
                                 # n_clusters = max(1, N // cluster_size)
   recluster_interval: -1        # re-run clustering every N steps (-1 = once at start)

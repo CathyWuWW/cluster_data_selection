@@ -62,6 +62,7 @@ from pmp.grad_utils import (
 )
 from pmp.model_wrapper import TransformerWrapper
 from trainer.ring_buffer import RingBuffer
+from utils.cluster_io import load_precomputed_cluster_ids
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +398,13 @@ class IntegratedClusterTrainer:
             split_name="train",
         )
         _print_rank0(f"Train dataset: {len(self.train_base_dataset)} samples", self.rank)
+        if len(cluster_ids) != len(self.train_base_dataset):
+            raise ValueError(
+                "Loaded cluster ids do not match the tokenized training dataset size: "
+                f"{len(cluster_ids)} vs {len(self.train_base_dataset)}. "
+                "Check that train_dir, tokenizer/max_length, and the saved assignments "
+                "come from the same dataset snapshot."
+            )
 
         self.train_dataset = ClusterDataset(self.train_base_dataset, cluster_ids)
         self.n_clusters = self.train_dataset.n_clusters
@@ -414,6 +422,7 @@ class IntegratedClusterTrainer:
                     text_field=cfg.data.text_field,
                     max_length=cfg.model.max_length,
                     max_samples=cfg.data.dev_num,
+                    sample_seed=getattr(cfg.data, "dev_seed", cfg.training.seed),
                     split_name=domain_cfg.name,
                 )
                 batches = self._cache_dev_batches(domain_ds, cfg.pmp.dev_batch_size)
@@ -431,6 +440,7 @@ class IntegratedClusterTrainer:
                 text_field=cfg.data.text_field,
                 max_length=cfg.model.max_length,
                 max_samples=cfg.data.dev_num,
+                sample_seed=getattr(cfg.data, "dev_seed", cfg.training.seed),
                 split_name="dev",
             )
             _print_rank0(f"Dev dataset: {len(dev_dataset)} samples", self.rank)
@@ -1306,6 +1316,22 @@ class IntegratedClusterTrainer:
         for fast parallel feature extraction, then rank 0 runs KMeans.
         Otherwise uses the training model with ZeRO-3.
         """
+        precomputed_ids_path = str(
+            getattr(cfg.clustering, "precomputed_ids_path", "")
+        ).strip()
+        if precomputed_ids_path:
+            _print_rank0(
+                f"Loading precomputed cluster ids from {precomputed_ids_path} ...",
+                self.rank,
+            )
+            cluster_ids = load_precomputed_cluster_ids(precomputed_ids_path)
+            _print_rank0(
+                f"Loaded {len(cluster_ids)} precomputed assignments covering "
+                f"{len(set(cluster_ids.tolist()))} clusters.",
+                self.rank,
+            )
+            return cluster_ids
+
         dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
         device = self.device
         clusterer = build_clusterer(cfg)

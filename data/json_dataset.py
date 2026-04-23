@@ -122,6 +122,7 @@ class JsonFolderDataset(Dataset):
         text_field: str = "text",
         max_length: int = 1024,
         max_samples: int = -1,
+        sample_seed: Optional[int] = None,
         split_name: str = "data",
     ):
         super().__init__()
@@ -142,7 +143,11 @@ class JsonFolderDataset(Dataset):
         texts = load_texts_from_dir(data_dir, text_field)
 
         if max_samples > 0 and len(texts) > max_samples:
-            texts = random.sample(texts, max_samples)
+            if sample_seed is None:
+                texts = random.sample(texts, max_samples)
+            else:
+                rng = random.Random(sample_seed)
+                texts = rng.sample(texts, max_samples)
 
         logger.info(f"[{split_name}] Tokenising {len(texts)} texts ...")
         self.data: List[np.ndarray] = self._tokenise_all(texts)
