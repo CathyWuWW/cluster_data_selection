@@ -4,6 +4,11 @@ outputs/
 valid/
 local_data/
 analysis_outputs/
+data/dev/
+
+# Experiment caches / local runtime artifacts
+.hf_cache/
+nohup.out
 
 # Python
 __pycache__/
@@ -13,6 +18,8 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_cache/
+.mypy_cache/
 
 # Environment
 .env

@@ -8,7 +8,7 @@
 # ============================================================
 
 model:
-  path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/llama-3.2-3B"                      # HuggingFace model name or local path (required)
+  path: "Qwen/Qwen2.5-0.5B"                      # HuggingFace model name or local path (required)
   type: "auto"                  # auto | mistral | llama | gpt2
   max_length: 1024              # max token length per sample
   dtype: "bfloat16"              # float16 | bfloat16 | float32
@@ -16,8 +16,8 @@ model:
   gradient_checkpointing: true  # enable gradient checkpointing to save memory
 
 data:
-  train_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/dataset-100k"                 # folder containing *.json / *.jsonl training files (required)
-  dev_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/valid"   # MMLU validation set (1531 samples)
+  train_dir: "local_data/slimpajama_6b_balanced/train"                 # folder containing *.json / *.jsonl training files (required)
+  dev_dir: "local_data/slimpajama_6b_balanced/valid"   # validation set directory for open-data runs
   text_field: "text"            # key name in each JSON record to use as text
   dev_num: 100                   # max number of dev samples for PMP backward gradient
   dev_seed: 42                  # random seed when subsampling dev_num from a larger dev directory
@@ -67,7 +67,7 @@ clustering:
     feature_batch_size: 256     # batch size when extracting features for KMeans (GPU free during clustering)
   embedding_model:              # Optional separate small model for clustering feature extraction
     enabled: true               # if true, use a lightweight model for embeddings (much faster)
-    path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/qwen2.5-0.5B"
+    path: "Qwen/Qwen2.5-0.5B"
     dtype: "bfloat16"
     attn_impl: "sdpa"
   ghost:                        # Ghost projection settings (only used if feature: "ghost")
