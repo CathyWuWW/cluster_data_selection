@@ -62,6 +62,14 @@ from pmp.grad_utils import (
 )
 from pmp.model_wrapper import TransformerWrapper
 from trainer.ring_buffer import RingBuffer
+from trainer.cluster_prototypes import (
+    ClusterPrototypes,
+    append_prototype_history,
+    build_prototype_init_from_model,
+    build_utility_pull_weights,
+    save_prototype_final,
+    save_prototype_init,
+)
 from utils.cluster_io import load_precomputed_cluster_ids
 
 logger = logging.getLogger(__name__)
@@ -408,6 +416,10 @@ class IntegratedClusterTrainer:
 
         self.train_dataset = ClusterDataset(self.train_base_dataset, cluster_ids)
         self.n_clusters = self.train_dataset.n_clusters
+        # Keep a copy of the initial per-sample cluster ids for downstream
+        # components (e.g. joint-loss prototype initialisation) that need
+        # to iterate the dataset *before* any recluster event happens.
+        self._cluster_ids_initial = np.asarray(cluster_ids, dtype=np.int64)
 
         # ---- Dev data ----
         _print_rank0("Loading dev data ...", self.rank)
@@ -537,6 +549,56 @@ class IntegratedClusterTrainer:
         self.ring_buffer = RingBuffer(capacity=cfg.pmp.window_size, param_dim=param_dim)
         self.grad_gamma = torch.zeros(self.n_clusters, dtype=torch.float32)
 
+        # ---- Optional Exp2 utility prior on grad_gamma (non-invasive) ----
+        # Only modifies the initial value of grad_gamma. PMP updates still drive
+        # subsequent dynamics; sampler / loss / gradient code stays untouched.
+        prior_cfg = getattr(cfg.pmp, "utility_prior", None)
+        if prior_cfg is not None and bool(getattr(prior_cfg, "enabled", False)):
+            try:
+                from analysis.utility_prior import load_utility_prior
+                prior_vec = load_utility_prior(
+                    csv_path=str(getattr(prior_cfg, "csv_path", "")),
+                    n_clusters=self.n_clusters,
+                    abilities=list(getattr(prior_cfg, "abilities", []) or []),
+                    weights=list(getattr(prior_cfg, "weights", []) or []),
+                    aggregator=str(getattr(prior_cfg, "aggregator", "sum")),
+                    normalize=str(getattr(prior_cfg, "normalize", "zscore")),
+                    alpha=float(getattr(prior_cfg, "alpha", 0.0)),
+                    sign=str(getattr(prior_cfg, "sign", "positive")),
+                )
+                prior_tensor = torch.from_numpy(prior_vec).float()
+                # 1) seed the accumulated grad_gamma so PMP updates start from
+                #    a non-zero baseline. With sign=positive, prior_vec already
+                #    encodes -alpha*u (high-utility cluster ⇒ negative gg ⇒
+                #    larger softmax weight via logits = -gg/T).
+                self.grad_gamma = prior_tensor.clone()
+                # 2) install a persistent sampler prior_bias that survives the
+                #    softmax/min_weight clamp. update_weights uses
+                #        logits = -(gg - prior_bias) / T,
+                #    so the equivalent persistent shift on logits is
+                #    +prior_bias/T. To keep "high utility ⇒ high weight" we
+                #    need +alpha*u on the logits, i.e. prior_bias = -prior_vec.
+                self.sampler.set_prior(-prior_tensor)
+                w0 = self.sampler.weights
+                _print_rank0(
+                    f"[utility_prior] enabled: csv={prior_cfg.csv_path} "
+                    f"alpha={float(prior_cfg.alpha):.4f} sign={prior_cfg.sign} "
+                    f"agg={prior_cfg.aggregator} norm={prior_cfg.normalize} "
+                    f"grad_gamma_init: min={float(self.grad_gamma.min()):.4f} "
+                    f"max={float(self.grad_gamma.max()):.4f} "
+                    f"norm={float(self.grad_gamma.norm()):.4f} ; "
+                    f"sampler.weights@init: min={float(w0.min()):.4f} "
+                    f"max={float(w0.max()):.4f} "
+                    f"std={float(w0.std()):.4f}",
+                    self.rank,
+                )
+            except Exception as e:
+                _print_rank0(
+                    f"[utility_prior] FAILED to load prior, falling back to zeros: {e}",
+                    self.rank,
+                )
+                self.grad_gamma = torch.zeros(self.n_clusters, dtype=torch.float32)
+
         # ---- CountSketch / Ghost IP projector (optional fast path) ----
         self.ghost_ip_projector = None
         self.count_sketch_projector = None
@@ -592,6 +654,19 @@ class IntegratedClusterTrainer:
         self.log_file = os.path.join(cfg.training.save_dir, f"{log_timestamp}.log")
         if self.rank == 0:
             _save_rank0(f"Config:\n{OmegaConf.to_yaml(cfg)}", self.log_file)
+
+        # ---- Joint Clustering Loss — Level 1 (optional) ----
+        # See docs/joint_loss_level1_design.md. When disabled, this call
+        # is a no-op and no prototype/utility state is created, so the
+        # legacy LM-only path stays byte-identical.
+        self.cluster_prototypes: Optional[ClusterPrototypes] = None
+        self.joint_pull_weights: Optional[torch.Tensor] = None  # [K] on self.device
+        self._joint_cfg = getattr(cfg, "joint_loss", None)
+        self._joint_enabled = bool(
+            self._joint_cfg is not None and getattr(self._joint_cfg, "enabled", False)
+        )
+        if self._joint_enabled:
+            self._init_joint_loss()
 
     # ------------------------------------------------------------------
     # Setup
@@ -744,6 +819,8 @@ class IntegratedClusterTrainer:
 
         # Accumulate buffers
         accumulated_loss = 0.0
+        accumulated_lm = 0.0
+        accumulated_pull = 0.0
         current_batch_cluster_ids: Optional[torch.Tensor] = None
         current_combined_batch: Optional[Dict] = None
 
@@ -791,7 +868,9 @@ class IntegratedClusterTrainer:
 
             # ---- Forward ----
             combined = {**model_batch, **no_model_batch}
-            loss = self._compute_lm_loss(model_batch, no_model_batch)
+            loss, loss_aux = self._compute_joint_loss(
+                model_batch, no_model_batch, cluster_ids_batch=cluster_ids_batch
+            )
             loss_scaled = loss / gacc
 
             # ---- Backward ----
@@ -800,6 +879,9 @@ class IntegratedClusterTrainer:
             else:
                 loss_scaled.backward()
             accumulated_loss += loss.item()
+            accumulated_lm += float(loss_aux["lm_loss"].item())
+            if loss_aux["pull_loss"] is not None:
+                accumulated_pull += float(loss_aux["pull_loss"].item())
 
             # Accumulate batch for ring buffer
             if current_combined_batch is None:
@@ -825,7 +907,13 @@ class IntegratedClusterTrainer:
                 self.model.step()
             else:
                 if clip_grad > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), clip_grad)
+                    if self.cluster_prototypes is not None:
+                        clip_params = list(self.model.parameters()) + list(
+                            self.cluster_prototypes.parameters()
+                        )
+                    else:
+                        clip_params = list(self.model.parameters())
+                    nn.utils.clip_grad_norm_(clip_params, clip_grad)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
@@ -843,16 +931,29 @@ class IntegratedClusterTrainer:
             current_combined_batch = None
             current_batch_cluster_ids = None
             avg_loss = accumulated_loss / gacc
+            avg_lm = accumulated_lm / gacc
+            avg_pull = accumulated_pull / gacc if self._joint_enabled else 0.0
             accumulated_loss = 0.0
+            accumulated_lm = 0.0
+            accumulated_pull = 0.0
 
             # ---- Logging ----
             if global_step % cfg.training.log_interval == 0:
                 lr_now = self.lr_scheduler.get_last_lr()[0]
-                msg = (
-                    f"step={global_step}/{self.total_steps} "
-                    f"loss={avg_loss:.4f} lr={lr_now:.2e} "
-                    f"ring_buf={len(self.ring_buffer)}"
-                )
+                if self._joint_enabled:
+                    lam = float(self._joint_cfg.lam)
+                    msg = (
+                        f"step={global_step}/{self.total_steps} "
+                        f"loss={avg_loss:.4f} lm={avg_lm:.4f} "
+                        f"pull={avg_pull:.4f} lam*pull={lam * avg_pull:.4f} "
+                        f"lr={lr_now:.2e} ring_buf={len(self.ring_buffer)}"
+                    )
+                else:
+                    msg = (
+                        f"step={global_step}/{self.total_steps} "
+                        f"loss={avg_loss:.4f} lr={lr_now:.2e} "
+                        f"ring_buf={len(self.ring_buffer)}"
+                    )
                 self._log(msg, global_step)
                 pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr_now:.2e}")
 
@@ -865,6 +966,17 @@ class IntegratedClusterTrainer:
                 and len(self.ring_buffer) > 0
             ):
                 self._run_pmp_backward_and_update(global_step)
+
+            # ---- Prototype stats (piggyback on pmp.update_interval, or
+            # joint_loss.log_interval if set to a positive value) ----
+            if self._joint_enabled:
+                proto_log_interval = int(getattr(self._joint_cfg, "log_interval", 0))
+                if proto_log_interval > 0:
+                    should_log = (global_step % proto_log_interval == 0)
+                else:
+                    should_log = (global_step % cfg.pmp.update_interval == 0)
+                if should_log:
+                    self._log_prototype_stats(global_step=global_step, event="step")
 
             # ---- Re-clustering ----
             if (
@@ -893,6 +1005,14 @@ class IntegratedClusterTrainer:
 
         pbar.close()
         self._log("Training complete.", self.total_steps)
+        # Persist final prototype (rank 0 only) BEFORE the final checkpoint
+        # so both land under training.save_dir.
+        if self._joint_enabled and self.rank == 0 and self.cluster_prototypes is not None:
+            save_prototype_final(
+                save_dir=self.cfg.training.save_dir,
+                mu_final=self.cluster_prototypes.mu.detach().cpu(),
+            )
+            self._log_prototype_stats(global_step=int(self.total_steps), event="final")
         self._save_checkpoint(global_step, final=True)
 
     # ------------------------------------------------------------------
@@ -900,6 +1020,7 @@ class IntegratedClusterTrainer:
     # ------------------------------------------------------------------
 
     def _compute_lm_loss(self, model_batch: Dict, no_model_batch: Dict) -> torch.Tensor:
+        """Legacy LM-only loss, used by _evaluate_multi_domain / _evaluate."""
         outputs = self.model(**model_batch, use_cache=False)
         logits = outputs.logits
         loss_fn = nn.CrossEntropyLoss(reduction="none")
@@ -911,6 +1032,95 @@ class IntegratedClusterTrainer:
             no_model_batch["loss_mask"].sum(dim=-1).clamp(min=1)
         )
         return lm_loss.mean()
+
+    def _compute_joint_loss(
+        self,
+        model_batch: Dict,
+        no_model_batch: Dict,
+        cluster_ids_batch: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Optional[torch.Tensor]]]:
+        """Total training loss used inside the training loop.
+
+        When ``joint_loss.enabled=false`` this returns exactly the legacy
+        LM loss and an aux dict with ``pull_loss=None``, so upstream
+        accounting (gradient_accumulation scaling, logging) stays
+        compatible.
+
+        When enabled it adds the cluster-pull regulariser; see
+        ``docs/joint_loss_level1_design.md``.
+
+        Args:
+            model_batch, no_model_batch: batched tensors on the training device.
+            cluster_ids_batch: required iff ``self._joint_enabled``. [B] long tensor
+                of meta-cluster ids for the current batch, on any device; we move
+                it to ``self.device`` internally.
+
+        Returns:
+            (total_loss, aux) where aux has keys:
+                "lm_loss":   detached tensor of the pre-pull LM loss.
+                "pull_loss": detached pull-loss tensor (before lam multiplication),
+                             or None if joint loss is disabled.
+        """
+        if not self._joint_enabled:
+            lm = self._compute_lm_loss(model_batch, no_model_batch)
+            return lm, {"lm_loss": lm.detach(), "pull_loss": None}
+
+        # --- joint path: one forward with output_hidden_states=True ---
+        outputs = self.model(
+            **model_batch,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+        logits = outputs.logits
+
+        loss_fn = nn.CrossEntropyLoss(reduction="none")
+        losses = loss_fn(
+            logits.view(-1, logits.size(-1)),
+            no_model_batch["label"].view(-1),
+        ).view(no_model_batch["label"].shape)
+        lm_loss = (losses * no_model_batch["loss_mask"]).sum(dim=-1) / (
+            no_model_batch["loss_mask"].sum(dim=-1).clamp(min=1)
+        )
+        lm_loss = lm_loss.mean()
+
+        # Pull term
+        assert self.cluster_prototypes is not None, (
+            "_compute_joint_loss: joint_loss enabled but prototypes not built"
+        )
+        if cluster_ids_batch is None:
+            raise RuntimeError(
+                "_compute_joint_loss: joint_loss enabled but cluster_ids_batch=None."
+                " The training loop must resolve cluster ids BEFORE calling this fn."
+            )
+
+        layer_idx = int(self._joint_cfg.layer_idx)
+        hidden_states = outputs.hidden_states  # tuple len = num_layers + 1
+        # Validate once per run.
+        max_layer = len(hidden_states) - 2  # -1 for tuple length, -1 because layer_idx is 0-based
+        if layer_idx < 0 or layer_idx > max_layer:
+            raise ValueError(
+                f"joint_loss.layer_idx={layer_idx} out of range [0, {max_layer}] "
+                f"for this model (num_layers={max_layer + 1})"
+            )
+        h_layer = hidden_states[layer_idx + 1]  # [B, L, H]
+
+        mask = model_batch["attention_mask"].to(h_layer.dtype).unsqueeze(-1)
+        pooled = (h_layer * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)  # [B, H]
+
+        ids = cluster_ids_batch.to(device=self.device, dtype=torch.long)
+        per_sample_pull = self.cluster_prototypes.pull_distance(pooled, ids)  # [B]
+
+        # Per-cluster pull weights w_k ∈ R^K (non-negative, mean≈1)
+        w_batch = self.joint_pull_weights[ids]  # [B]
+        pull_loss = (per_sample_pull * w_batch).mean()
+
+        lam = float(self._joint_cfg.lam)
+        total = lm_loss + lam * pull_loss
+
+        return total, {
+            "lm_loss": lm_loss.detach(),
+            "pull_loss": pull_loss.detach(),
+        }
 
     # ------------------------------------------------------------------
     # PMP backward pass (Hessian = 0)
@@ -1305,6 +1515,188 @@ class IntegratedClusterTrainer:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # ------------------------------------------------------------------
+    # Joint Clustering Loss — Level 1 helpers
+    # ------------------------------------------------------------------
+
+    def _init_joint_loss(self) -> None:
+        """Build ClusterPrototypes + pull weights + prototype optimiser group.
+
+        Prerequisites (checked here):
+          - not use_deepspeed (Level 1 only supports DDP / single-GPU).
+          - self.optimizer exists (non-DeepSpeed path).
+          - self.train_dataset and self._cluster_ids_initial are set.
+
+        Side effects:
+          - self.cluster_prototypes:  ClusterPrototypes on self.device.
+          - self.joint_pull_weights:  [K] float tensor on self.device.
+          - self.optimizer gets a new param group dedicated to prototypes
+            (lr scaled by proto_lr_multiplier, weight_decay=0).
+          - Writes prototype_init.npy + prototype_init_meta.json (rank 0).
+        """
+        cfg = self.cfg
+        joint = self._joint_cfg
+
+        if self.use_deepspeed:
+            raise RuntimeError(
+                "joint_loss.enabled=true is not supported with DeepSpeed in "
+                "Level 1. Set deepspeed.enabled=false or joint_loss.enabled=false."
+            )
+        if not hasattr(self, "optimizer") or self.optimizer is None:
+            raise RuntimeError(
+                "_init_joint_loss: self.optimizer must exist before joint init."
+            )
+
+        # -- figure out hidden size from the raw model config --
+        hf_config = getattr(self._raw_model, "config", None)
+        hidden_size = int(getattr(hf_config, "hidden_size", 0))
+        if hidden_size <= 0:
+            raise RuntimeError(
+                f"_init_joint_loss: cannot read hidden_size from {type(self._raw_model)}"
+            )
+        num_layers = int(getattr(hf_config, "num_hidden_layers", 0))
+        layer_idx = int(joint.layer_idx)
+        if not (0 <= layer_idx < num_layers):
+            raise ValueError(
+                f"joint_loss.layer_idx={layer_idx} out of [0, {num_layers - 1}]"
+            )
+
+        # -- build init tensor --
+        init_source = str(joint.init.source)
+        if init_source == "feature_mean":
+            _print_rank0(
+                f"[joint-loss] extracting per-cluster hidden-mean prototype init "
+                f"(layer={layer_idx}, K={self.n_clusters}, H={hidden_size}, "
+                f"N={len(self.train_base_dataset)})",
+                self.rank,
+            )
+            mu_init, counts, duration_s = build_prototype_init_from_model(
+                raw_model=self._raw_model,
+                train_dataset=self.train_base_dataset,
+                cluster_ids=self._cluster_ids_initial,
+                n_clusters=self.n_clusters,
+                layer_idx=layer_idx,
+                hidden_size=hidden_size,
+                device=self.device,
+                batch_size=int(joint.init.batch_size),
+                max_samples_per_cluster=int(joint.init.max_samples_per_cluster),
+                verbose=(self.rank == 0),
+            )
+            _print_rank0(
+                f"[joint-loss] prototype init done in {duration_s:.1f}s "
+                f"(empty_clusters={int((counts == 0).sum())})",
+                self.rank,
+            )
+        elif init_source == "random":
+            mu_init = None  # ClusterPrototypes default init
+            counts = np.zeros(self.n_clusters, dtype=np.int64)
+            duration_s = 0.0
+        elif init_source == "zero":
+            mu_init = torch.zeros(self.n_clusters, hidden_size, dtype=torch.float32)
+            counts = np.zeros(self.n_clusters, dtype=np.int64)
+            duration_s = 0.0
+        else:
+            raise ValueError(f"unknown joint_loss.init.source={init_source!r}")
+
+        # -- build the module on training device --
+        self.cluster_prototypes = ClusterPrototypes(
+            n_clusters=self.n_clusters,
+            hidden_size=hidden_size,
+            init_tensor=mu_init,
+            distance=str(joint.distance),
+        ).to(self.device)
+
+        # Free extraction-time activations before we start training.
+        torch.cuda.empty_cache()
+
+        # -- per-cluster pull weights --
+        weight_mode = str(joint.weight.mode)
+        if weight_mode == "uniform":
+            w = np.ones(self.n_clusters, dtype=np.float32)
+        elif weight_mode == "utility":
+            csv_path = str(joint.weight.utility_csv)
+            if not csv_path:
+                raise ValueError(
+                    "joint_loss.weight.mode=utility requires joint_loss.weight.utility_csv"
+                )
+            _print_rank0(
+                f"[joint-loss] loading utility pull weights from {csv_path}",
+                self.rank,
+            )
+            w = build_utility_pull_weights(
+                csv_path=csv_path,
+                n_clusters=self.n_clusters,
+                abilities=list(getattr(joint.weight, "abilities", []) or []),
+                weights=list(getattr(joint.weight, "weights", []) or []),
+                aggregator=str(joint.weight.aggregator),
+                normalize=str(joint.weight.normalize),
+                sign=str(joint.weight.sign),
+                floor=float(getattr(joint.weight, "floor", 0.0)),
+                base_to_meta_csv=(
+                    str(getattr(joint.weight, "base_to_meta_csv", "") or "") or None
+                ),
+            )
+        else:
+            raise ValueError(f"unknown joint_loss.weight.mode={weight_mode!r}")
+
+        self.joint_pull_weights = torch.from_numpy(w).to(
+            device=self.device, dtype=torch.float32
+        )
+
+        # -- add prototype param group to the existing optimiser --
+        proto_lr = float(cfg.training.lr) * float(joint.proto_lr_multiplier)
+        self.optimizer.add_param_group(
+            {
+                "params": list(self.cluster_prototypes.parameters()),
+                "lr": proto_lr,
+                "weight_decay": 0.0,
+                "name": "cluster_prototypes",
+            }
+        )
+        _print_rank0(
+            f"[joint-loss] enabled: lam={float(joint.lam):.4f} "
+            f"distance={str(joint.distance)} layer_idx={layer_idx} "
+            f"weight_mode={weight_mode} proto_lr={proto_lr:.2e} "
+            f"w_k(min/mean/max)=({float(self.joint_pull_weights.min()):.3f}/"
+            f"{float(self.joint_pull_weights.mean()):.3f}/"
+            f"{float(self.joint_pull_weights.max()):.3f})",
+            self.rank,
+        )
+
+        # -- persist the init + meta (rank 0 only) --
+        if self.rank == 0:
+            save_prototype_init(
+                save_dir=cfg.training.save_dir,
+                mu_init=self.cluster_prototypes.mu.detach().cpu(),
+                counts=counts,
+                layer_idx=layer_idx,
+                duration_s=duration_s,
+                extra={
+                    "init_source": init_source,
+                    "distance": str(joint.distance),
+                    "lam": float(joint.lam),
+                    "weight_mode": weight_mode,
+                    "weight_vector": self.joint_pull_weights.detach().cpu().tolist(),
+                    "proto_lr_multiplier": float(joint.proto_lr_multiplier),
+                    "hidden_size": hidden_size,
+                },
+            )
+            # Also append a step=0 prototype_history entry so downstream
+            # analysis has a non-trivial reference point.
+            self._log_prototype_stats(global_step=0, event="init")
+
+    def _log_prototype_stats(self, global_step: int, event: str = "step") -> None:
+        """Append one prototype_history.jsonl record (rank 0 only)."""
+        if self.rank != 0 or self.cluster_prototypes is None:
+            return
+        metrics = self.cluster_prototypes.pairwise_metrics()
+        append_prototype_history(
+            save_dir=self.cfg.training.save_dir,
+            step=global_step,
+            metrics=metrics,
+            extra={"event": event},
+        )
+
+    # ------------------------------------------------------------------
     # Clustering (shared by __init__ and _recluster)
     # ------------------------------------------------------------------
 
@@ -1346,7 +1738,9 @@ class IntegratedClusterTrainer:
             # later JsonFolderDataset filtering.
             _print_rank0("Preparing tokenized dataset for random clustering ...", self.rank)
             random_tokenizer = AutoTokenizer.from_pretrained(
-                cfg.model.path, use_fast=True, trust_remote_code=True
+                cfg.model.path,
+                use_fast=True,
+                trust_remote_code=getattr(cfg.model, "trust_remote_code", False),
             )
             if random_tokenizer.pad_token is None:
                 random_tokenizer.pad_token = random_tokenizer.eos_token

@@ -70,6 +70,7 @@ clustering:
     path: "Qwen/Qwen2.5-0.5B"
     dtype: "bfloat16"
     attn_impl: "sdpa"
+    trust_remote_code: false    # whether to allow custom remote modeling/tokenizer code from HF Hub
   ghost:                        # Ghost projection settings (only used if feature: "ghost")
     enabled: true               # enable ghost projection for clustering
     strategy: "layerwise"       # layerwise | random | frequency
@@ -115,6 +116,25 @@ pmp:
     seed: 42                    # random seed for sketch hash/sign tables
     strategy: "random"          # random | layerwise | frequency (only for rademacher/gaussian)
     fraction: 0.5               # fraction of parameters to keep in mask (only for rademacher/gaussian)
+  utility_prior:                # Optional Exp2-utility prior on grad_gamma initialization.
+                                # Non-invasive: only seeds grad_gamma at start of training,
+                                # PMP updates still drive subsequent dynamics.
+    enabled: false              # if true, initialize grad_gamma from a utility CSV
+    csv_path: ""                # path to a utility CSV (e.g. utility_matrix_sum_delta.csv)
+                                # rows must be aligned with cluster_id 0..K-1 of the run
+    abilities: []               # which CSV columns to use; empty = all non-id columns
+    weights: []                 # optional per-ability weights (same length as abilities);
+                                # empty = uniform; will be auto-normalized to sum=1
+    aggregator: "sum"           # how to fuse multi-ability utility into a scalar per cluster:
+                                #   sum | mean | max | weighted_sum
+    normalize: "zscore"         # per-cluster scalar normalization before scaling:
+                                #   none | zscore | minmax | rank
+    alpha: 0.0                  # prior strength; final init = alpha * normalized_utility
+                                # 0 = no prior (equivalent to disabled)
+    sign: "positive"            # "positive" => higher utility → higher sampling weight.
+                                # "negative" => lower utility → higher sampling weight.
+                                # Implementation note: w_k = softmax(-grad_gamma/T), so to
+                                # boost high-utility clusters we set grad_gamma_init = -alpha*u.
 
 training:
   total_iters: 500              # total gradient update steps (quick validation)
@@ -153,3 +173,36 @@ proxy:
 deepspeed:
   enabled: false                # set true to use DeepSpeed instead of DDP
   config_file: "configs/ds_zero1.json"
+
+# Joint Clustering Loss — Level 1 (see docs/joint_loss_level1_design.md).
+# Adds a cluster-pull regulariser alongside the LM loss:
+#     L_total = L_LM + lam * mean_i( w_{k_i} * dist(h(x_i), mu_{k_i}) )
+# where mu_k ∈ R^H is a learnable prototype per cluster, h(x) is the masked
+# mean-pool of a chosen transformer layer's hidden states, and w_k is an
+# optional utility-driven per-cluster weight.
+# When enabled=false, _compute_joint_loss is byte-identical to the legacy
+# LM-only loss, so existing runs are unaffected.
+joint_loss:
+  enabled: false                # master switch
+  lam: 0.0                      # strength of the pull term (0 = sanity: modules wired but no pull signal)
+  layer_idx: 14                 # 0-indexed transformer layer for h(x). 14 ≈ middle of Qwen2.5-1.5B (28 layers).
+  distance: "cosine"            # cosine | squared_l2
+  pooling: "mean"               # only "mean" supported in Level 1
+  proto_lr_multiplier: 10.0     # prototype group lr = training.lr * this factor; weight_decay=0
+  init:
+    source: "feature_mean"      # feature_mean | random | zero
+    # Optional: cap samples per cluster when running hidden-mean extraction.
+    # -1 means use all samples. Useful only for extremely large datasets.
+    max_samples_per_cluster: -1
+    batch_size: 8               # mini-batch for the one-time pre-training extraction
+  weight:                       # per-cluster pull weight w_k
+    mode: "uniform"             # uniform | utility
+    utility_csv: ""             # path to utility_matrix_*.csv (only when mode=utility)
+    base_to_meta_csv: ""        # path to base_cluster_to_meta_cluster.csv (only when mode=utility and using meta-clusters)
+    abilities: []               # empty = use all non-id CSV columns
+    weights: []                 # empty = uniform across abilities; same length as abilities otherwise
+    aggregator: "sum"           # sum | mean | max | weighted_sum
+    normalize: "zscore"         # none | zscore | minmax | rank
+    sign: "positive"            # positive = higher utility → larger w_k
+    floor: 0.0                  # post-aggregate clip floor; 0 means zero-floor (strictly non-negative)
+  log_interval: 0               # extra prototype_history logging cadence (0 = piggyback on pmp.update_interval)

@@ -127,6 +127,10 @@ class ClusterWeightedSampler(Sampler):
         K = dataset.n_clusters
         self._weights = torch.ones(K, dtype=torch.float32) / K  # uniform init
         self._grad_gamma = torch.zeros(K, dtype=torch.float32)
+        # Persistent prior bias on grad_gamma (length K). Subtracted from
+        # grad_gamma in every update_weights call, so it cannot be flattened
+        # by the softmax/min_weight clamp. Set via set_prior(); zeros by default.
+        self._prior_bias = torch.zeros(K, dtype=torch.float32)
 
         self._epoch = 0
         self._rng = np.random.default_rng(seed)
@@ -164,7 +168,9 @@ class ClusterWeightedSampler(Sampler):
                               If None, streak tracking is skipped.
         """
         gg = grad_gamma.float()
-        logits = -gg / self.temperature
+        # Apply persistent prior bias if any (zeros by default → no-op).
+        gg_eff = gg - self._prior_bias.to(gg.device).to(gg.dtype)
+        logits = -gg_eff / self.temperature
         # Numerically stable softmax
         logits = logits - logits.max()
         weights = torch.exp(logits)
@@ -229,6 +235,39 @@ class ClusterWeightedSampler(Sampler):
         return int((~self._dead_clusters).sum().item())
 
     # ------------------------------------------------------------------
+    # Prior bias management
+    # ------------------------------------------------------------------
+
+    def set_prior(self, prior_bias: torch.Tensor) -> None:
+        """
+        Install a persistent per-cluster prior bias on grad_gamma.
+
+        Effect:
+            update_weights() computes
+                w_k = softmax( -(grad_gamma_k - prior_bias_k) / T )
+            so the prior survives the softmax/min_weight clamp instead of
+            being absorbed by `logits -= logits.max()`.
+
+        Calling this also immediately recomputes self._weights so that the
+        sampler reflects the prior from the very first batch.
+        """
+        bias = prior_bias.detach().float().reshape(-1).cpu()
+        if bias.numel() != self._weights.numel():
+            raise ValueError(
+                f"set_prior: bias length {bias.numel()} != n_clusters "
+                f"{self._weights.numel()}"
+            )
+        self._prior_bias = bias
+        # Refresh weights so the very first batch already reflects the prior.
+        # We pass the current accumulated grad_gamma (zeros at startup) and
+        # reuse the standard softmax/clamp/renorm path.
+        self.update_weights(self._grad_gamma)
+
+    @property
+    def prior_bias(self) -> torch.Tensor:
+        return self._prior_bias.clone()
+
+    # ------------------------------------------------------------------
     # Sampler protocol
     # ------------------------------------------------------------------
 
@@ -285,7 +324,9 @@ class ClusterWeightedSampler(Sampler):
                          If None, behaves like standard update_weights().
         """
         gg = grad_gamma.float()
-        
+        # Apply persistent prior bias if any (zeros by default → no-op).
+        gg = gg - self._prior_bias.to(gg.device).to(gg.dtype)
+
         # Apply ghost masking if provided
         if ghost_mask is not None:
             ghost_mask = ghost_mask.to(gg.device).float()
